@@ -1,17 +1,50 @@
 #!/usr/bin/env python3
 import asyncio
+import jinja2
 import logging
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from typing import Any, Dict, List, Union
 
+from influxclient import InfluxClient
 import aiohttp
 
-# InfluxDB2 defaults
+# Task template; shared Jinja2 env is fine.
+task_template = jinja2.Template("""option v = {bucket: "_monitoring", timeRangeStart: -1h, timeRangeStop: now(), windowPeriod: 10000ms}
 
-DEFAULT_ORG = "default"
-DEFAULT_URL = "http://localhost:8086"
+option task = {name: "{{taskname}}", every: 1m}
+
+from(bucket: "{{app_bucket}}")
+    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+    |> filter(fn: (r) => r["_measurement"] == "kubernetes_pod_container")
+    |> drop(
+        columns: [
+            "_start",
+            "_stop",
+            "_host",
+            "namespace",
+            "host",
+            "node_name",
+            "phase",
+            "readiness",
+            "state",
+        ],
+    )
+    |> filter(fn: (r) => r["_field"] == "restarts_total")
+    |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+    |> tail(n: 2)
+    |> difference(columns: ["_value"])
+    |> duplicate(column: "_value", as: "differential_restart")
+    |> yield(name: "mean")
+    |> to(bucket: "{{target_bucket}}", org: "square")
+""")
+
+# Utility Function
+def fupper(inp: str) -> str:
+    if not str:
+        return ""
+    return inp[0].upper() + inp[1:]
 
 # Simple typealiases to represent InfluxDB v2 object fields
 # Unless otherwise specified, they can be found at:
@@ -75,6 +108,7 @@ class BucketGet:
     retentionRules: list[RetentionRule] = field(default_factory=list)
     type: str = "user"
 
+@dataclass
 class BucketPost:
     """An InfluxDB v2 Bucket, that you would send to
     https://docs.influxdata.com/influxdb/v2.2/api/#operation/PostBuckets
@@ -84,51 +118,66 @@ class BucketPost:
     name: str = ""
     orgID: str = ""
     retentionRules: list[RetentionRule] = field(default_factory=list)
-    rp: str = ""
-    
 
 @dataclass
-
-
-class RestartMapper:
-    """It wants the same InfluxDBv2 environment variables as InfluxDBv2 or
-    Chronograf:
-    * INFLUXDB_TOKEN
-    * INFLUXDB_URL
-    * INFLUXDB_ORG
-
+class TaskGet:
+    """An InfluxDB v2 Task, as returned from
+    https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetTasks
     """
 
-    def __init__(
-        self,
-        token: str = os.getenv("INFLUXDB_TOKEN") or "",
-        url: str = os.getenv("INFLUXDB_URL") or DEFAULT_URL,
-        org: str = os.getenv("INFLUXDB_ORG") or DEFAULT_ORG,
-        debug: bool = bool(os.getenv("DEBUG")) or False,
-    ) -> None:
-        assert token, "INFLUXDB_TOKEN or token param must be set"
-        loglevel = logging.WARNING
-        self.debug = debug
-        if self.debug:
-            loglevel = logging.DEBUG
-        logging.basicConfig(
-            format="%(asctime)s %(levelname)s:%(message)s", level=loglevel
-        )
-        self.log = logging.getLogger(__name__)
-        self.log.debug("Logging established.")
-        self.org = org
-        self.api_url = url + "/api/v2"
-        self.params = {"org": self.org}
-        self.session = aiohttp.ClientSession()
-        self.session.headers.update({"Authorization": f"Token {token}"})
+    authorizationID: str = ""
+    createdAt: str = ""
+    cron: str = ""
+    description: str = ""
+    every: str = ""
+    flux: str = ""
+    id: str = ""
+    orgID: str = ""
+    labels: List[Label] = field(default_factory=list)
+    lastRunError: str = ""
+    lastRunStatus: str = ""
+    latestCompleted: str = ""
+    links: list[BucketLinks] = field(default_factory=list)
+    name: str = ""
+    offset: str = ""
+    org: str = ""
+    orgID: str = ""
+    ownerID: str = ""
+    status: str = ""
+    type: str = ""
+    updatedAt: str = ""
 
-    async def __aenter__(self):
-        return self
+@dataclass
+class TaskPost:
+    """An InfluxDB v2 Task definition you'd send to create the Task."""
+    description: str = ""
+    flux: str = ""
+    org: str = ""
+    orgID: str = ""
+    status: str = "active"
+    
+class RestartMapper(InfluxClient):
+    """The logic needed to build alerts and tasks for applications.
+    """
+    async def set_org_id(self) -> None:
+        """Set the Organization ID, given the Organization name.
 
-    async def __aexit__(self, *excinfo):
-        if self.session:
-            await self.session.close()
-
+        This doesn't actually work, even if you have r/w on orgs--you just
+        get an empty list back.
+        """
+        url = f"{self.api_url}/orgs"
+        resp = await self.session.get(url, params={})
+        obj = await resp.json()
+        orgs = obj["orgs"]
+        self.log.debug(f"Obj -> {obj}")
+        for o in orgs:
+            if o["name"] == self.org:
+                self.org_id = o["id"]
+                return
+        raise RuntimeError(f"Could not determine orgID for org {self.org}")
+        
+        
+            
     async def list_buckets(self) -> List[BucketGet]:
         """List all buckets."""
         url = f"{self.api_url}/buckets"
@@ -155,6 +204,9 @@ class RestartMapper:
             last_id = bucketlist[-1]["id"]
         buckets = [BucketGet(**x) for x in b_list]
         self.log.debug(f"Buckets -> {[x.name for x in buckets]}")
+        if buckets:
+            # This is cheesy, but the orgs permissions don't work.
+            self.org_id = buckets[0].orgID
         return buckets
 
     async def find_application_buckets(self,
@@ -165,6 +217,7 @@ class RestartMapper:
         app_buckets = [ b for b in buckets if b.name[0] != "_" and
                         b.name[-1] != "_" ]
         self.log.debug(f"App Buckets -> {[x.name for x in app_buckets]}")
+        self.app_names = [ x.name for x in app_buckets ]
         return app_buckets
 
     async def find_restart_buckets(self,
@@ -178,31 +231,108 @@ class RestartMapper:
                        f"-> {[x.name for x in restart_buckets]}")
         return restart_buckets
 
-    async def construct_restart_buckets(self,
-                                        apps: List[BucketGet],
-                                        extant: List[BucketGet])->None:
-        appnames = [x.name for x in apps]
+    async def construct_restart_buckets(self) -> None:
+        buckets = await self.list_buckets()
+        if not buckets:
+            return
+        await self.find_application_buckets(buckets)
+        extant = await self.find_restart_buckets(buckets)
+
+        appnames = self.app_names
         extantnames = [x.name for x in extant]
         newnames = [f"{n}_restarts_" for n in appnames
                     if f"{n}_restarts_" not in extantnames]
+        if not newnames:
+            return
         self.log.debug(f"Buckets to be constructed: {newnames}")
         tasks = []
-        for b in newnames:
-            task = self.create_bucket(b)
-            tasks.append(task)
-        await responses = asyncio.gather(*tasks)
-
-    async def create_bucket(self, name: str) -> asyncio.Task:
         url = f"{self.api_url}/buckets"
+        rr: List[RetentionRule] = [ {
+            "everySeconds": 3600,
+            "shardGroupDurationSeconds": 3600,
+            "type": "expire"
+        } ]
+        bkts = [ BucketPost(
+                description=f"{fupper(b)} restart tracking bucket",
+                name=b,
+                orgID=self.org_id,
+                retentionRules=rr) for b in newnames ]
+        payloads = [asdict(bkt) for bkt in bkts]
+        self.log.debug(payloads[0])
+        payload_futs = [
+            self.session.post(
+                url,
+                json=x,
+                params=self.params)
+            for x in payloads ]
+        resps = await asyncio.gather(*payload_futs)
+        self.log.debug(resps)
+
+    async def construct_tasks(self) -> None:
+        extant_tasks = await self.list_tasks()
+        extant_tnames = [ x.name for x in extant_tasks ]
+        apps_needing_tasks = [ x for x in self.app_names if
+                               f"{fupper(x)} restarts" not in extant_tnames ]
+        self.log.debug(f"Apps needing tasks -> {apps_needing_tasks}")
+
+        new_tasks = self.build_tasks(apps_needing_tasks)
+        payloads = [asdict(x) for x in new_tasks]
+        self.log.debug(payloads[0])
+        url = f"{self.api_url}/tasks"        
+        payload_futs = [
+            self.session.post(
+                url,
+                json=x)
+            for x in payloads ]
+        resps = await asyncio.gather(*payload_futs)
+        self.log.debug(resps)
+
+    def build_tasks(self, apps: List[str]) -> List[TaskPost]:
+        """Create a list of task objects to post."""
+        tasks = []
+        for app in apps:
+            input_bkt = app
+            taskname = f"{fupper(app)} restarts"
+            tgt_bkt = f"{app}_restarts_"
+            tasks.append(TaskPost(
+                description=taskname,
+                org=self.org,
+                orgID=self.org_id,
+                status="active",
+                flux=task_template.render(
+                    taskname=taskname,
+                    app_bucket=app,
+                    target_bucket=tgt_bkt)))
+        return tasks
+
+    async def list_tasks(self) -> List[BucketGet]:
+        """List all tasks."""
+        url = f"{self.api_url}/tasks"
+        t_list = []
+        pagesize = 100
+        params: Dict[str, Any] = {"limit": pagesize}
+        params.update(self.params)
+        last_id = ""
+        while True:
+            if last_id:
+                params.update({"after": last_id})
+            resp = await self.session.get(url, params=params)
+            obj = await resp.json()
+            tasklist = obj["tasks"]
+            if not tasklist:
+                break
+            t_list.extend(tasklist)
+            last_id = tasklist[-1]["id"]
+        tasks = [TaskGet(**x) for x in t_list]
+        self.log.debug(f"Tasks -> {[x for x in tasks]}")
+        return tasks
+
         
-    
 
 async def main() -> None:
     async with RestartMapper() as rm:
-        buckets = await rm.list_buckets()
-        app_buckets = await rm.find_application_buckets(buckets)
-        extant_restart_buckets = await rm.find_restart_buckets(buckets)
-        await rm.construct_restart_buckets(app_buckets, extant_restart_buckets)
+        await rm.construct_restart_buckets()
+        await rm.construct_tasks()
 
 
 if __name__ == "__main__":
