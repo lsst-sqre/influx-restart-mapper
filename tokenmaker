@@ -9,15 +9,14 @@ from influxclient import InfluxClient
 
 import aiohttp
 
-TokenPost = Dict[str,Union[str,Dict[str,str]]]
+TokenPost = Dict[str, Union[str, Dict[str, str]]]
+
 
 class TokenMaker(InfluxClient):
-
     async def set_org_id(self) -> None:
         """Set the org id; requires org read permission in token"""
         url = f"{self.api_url}/orgs"
-        resp = await self.session.get(url, params=self.params)
-        obj = await resp.json()
+        obj = await self.get(url)
         orgs = obj["orgs"]
         for o in orgs:
             if o["name"] == self.org:
@@ -26,26 +25,27 @@ class TokenMaker(InfluxClient):
                 return
         raise RuntimeError(f"Could not determine orgID for org {self.org}")
 
-    
     def define_token(self) -> TokenPost:
         tok = {
             "description": "Token for task/alert creation",
             "orgID": self.org_id,
             "status": "active",
-            "permissions": []
+            "permissions": [],
         }
         perms = []
-        categories = ("buckets", "orgs", "tasks", "notificationRules",
-                      "notificationEndpoints")
+        categories = (
+            "buckets",
+            "checks",
+            "orgs",
+            "tasks",
+            "notificationRules",
+            "notificationEndpoints",
+        )
         for c in categories:
             for mode in ("read", "write"):
-                perms.append({
-                    "action": mode,
-                    "resource": {
-                        "orgID": self.org_id,
-                        "type": c
-                        }
-                    })
+                perms.append(
+                    {"action": mode, "resource": {"orgID": self.org_id, "type": c}}
+                )
         tok["permissions"] = perms
         self.log.debug(f"Token: {tok}")
         return tok
@@ -53,19 +53,16 @@ class TokenMaker(InfluxClient):
     async def create_token(self, tok):
         """Create an Authorization in InfluxDB."""
         url = f"{self.api_url}/authorizations"
-        resp = await self.session.post(url, json=tok, params=self.params)
-
-        obj = await resp.json()
-        self.log.debug(f"obj = {obj}")
+        obj = await self.post(url, [tok])
         self.log.debug(f"token = {obj['token']}")
-        
-        
+
+
 async def main() -> None:
     async with TokenMaker() as tm:
         await tm.set_org_id()
         tok = tm.define_token()
         await tm.create_token(tok)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
-
