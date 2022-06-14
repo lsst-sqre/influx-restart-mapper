@@ -3,11 +3,13 @@ import asyncio
 import jinja2
 import logging
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from datetime import timedelta
-from typing import Any, Dict, List, Union
+from typing import Any, List
 
 from influxclient import InfluxClient
+from influxtypes import (BucketGet, BucketPost, TaskGet, TaskPost,
+                         CheckPost, DashboardQuery)
 import aiohttp
 
 # Task template; shared Jinja2 env is fine.
@@ -41,6 +43,22 @@ from(bucket: "{{app_bucket}}")
 """
 )
 
+check_text = """import "influxdata/influxdb/monitor"
+import "influxdata/influxdb/v1"
+
+data =
+    from(bucket: "restarts_")
+        |> range(start: -1m)
+        |> filter(fn: (r) => r["_measurement"] == "kubernetes_pod_container")
+        |> filter(fn: (r) => r["_field"] == "restarts_total")
+        |> aggregateWindow(every: 1m, fn: last, createEmpty: false)
+
+crit = (r) => r["restarts_total"] != 0.0
+messageFn = (r) => "Check: ${r._check_name}: ${r._value} restarts for ${r.cluster}/${r.container_name}/${r.pod_name}"
+
+data |> v1["fieldsAsCols"]() |> monitor["check"](data: check, messageFn: messageFn, crit: crit)
+"""
+
 # Utility Function
 def fupper(inp: str) -> str:
     if not str:
@@ -48,118 +66,6 @@ def fupper(inp: str) -> str:
     return inp[0].upper() + inp[1:]
 
 
-# Simple typealiases to represent InfluxDB v2 object fields
-# Unless otherwise specified, they can be found at:
-#      https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetBuckets
-# "self" doesn't work as an object attribute, unsurprisingly.
-
-RetentionRule = Dict[str, Union[int, str]]
-"""An InfluxDB v2 RetentionRule.  Valid keys:
-* everySeconds: int
-* shardGroupDurationSeconds: int
-* type: str
-"""
-
-
-BucketLinks = List[Dict[str, str]]
-"""Links for a Bucket object.  Valid keys (all str):
-* labels
-* members
-* org
-* owners
-* self
-* write
-"""
-
-URILinks = List[Dict[str, str]]
-"""Links for a paginated InfluxDB v2 object.  Valid keys:
-* self
-* next
-* prev
-"""
-
-# Some dataclasses to represent InfluxDB v2 objects
-# Unless otherwise specified, they can be found at:
-#      https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetBuckets
-
-
-@dataclass
-class Label:
-    """An InfluxDB Label."""
-
-    id: str = ""
-    name: str = ""
-    orgId: str = ""
-    properties: Dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
-class BucketGet:
-    """An InfluxDB v2 Bucket, as returned from
-    https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetBuckets
-    """
-
-    createdAt: str = ""
-    description: str = ""
-    id: str = ""
-    orgID: str = ""
-    updatedAt: str = ""
-    labels: list[Label] = field(default_factory=list)
-    links: list[BucketLinks] = field(default_factory=list)
-    name: str = ""
-    retentionRules: list[RetentionRule] = field(default_factory=list)
-    type: str = "user"
-
-
-@dataclass
-class BucketPost:
-    """An InfluxDB v2 Bucket, that you would send to
-    https://docs.influxdata.com/influxdb/v2.2/api/#operation/PostBuckets
-    """
-
-    description: str = ""
-    name: str = ""
-    orgID: str = ""
-    retentionRules: list[RetentionRule] = field(default_factory=list)
-
-
-@dataclass
-class TaskGet:
-    """An InfluxDB v2 Task, as returned from
-    https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetTasks
-    """
-
-    authorizationID: str = ""
-    createdAt: str = ""
-    cron: str = ""
-    description: str = ""
-    every: str = ""
-    flux: str = ""
-    id: str = ""
-    orgID: str = ""
-    labels: List[Label] = field(default_factory=list)
-    lastRunError: str = ""
-    lastRunStatus: str = ""
-    latestCompleted: str = ""
-    links: list[BucketLinks] = field(default_factory=list)
-    name: str = ""
-    offset: str = ""
-    org: str = ""
-    ownerID: str = ""
-    status: str = ""
-    type: str = ""
-    updatedAt: str = ""
-
-
-@dataclass
-class TaskPost:
-    """An InfluxDB v2 Task definition you'd send to create the Task."""
-
-    description: str = ""
-    flux: str = ""
-    org: str = ""
-    orgID: str = ""
-    status: str = "active"
 
 
 class RestartMapper(InfluxClient):
@@ -266,8 +172,35 @@ class RestartMapper(InfluxClient):
         self.log.debug(f"Tasks -> {[x for x in tasks]}")
         return tasks
 
-    async def construct_check(self):
-        pass
+    async def construct_check(self) -> List[Any]:
+        self.check_id = ""
+        cname = "K8s app restarts TEST"
+        itemtype = "checks"
+        url = f"{self.api_url}/{itemtype}"
+        obj_list = await self.list_all_with_offset(url, itemtype)
+        self.log.debug(f"Checks -> {obj_list}")
+        for c in obj_list:
+            if c["name"] == cname:
+                self.check_id = c["id"]
+                break
+        if not self.check_id:
+            cc = await self.create_check(cname)
+            payloads = [ asdict(cc) ]
+            await self.post(url,payloads)
+            # gives a 400 Bad Request right now.
+
+    async def create_check(self, cname):
+        dq = DashboardQuery(
+            name = cname,
+            text = check_text)
+        ck = CheckPost(
+            description=cname,
+            every="1m",
+            orgID=self.org_id,
+            query=dq,
+        )
+        return ck
+
 
 
 async def main() -> None:

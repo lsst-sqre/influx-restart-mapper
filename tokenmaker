@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from typing import Any, Dict, List, Union
 from influxclient import InfluxClient
+from influxtypes import TokenPost, Permission, Resource
 
 import aiohttp
 
@@ -26,13 +27,7 @@ class TokenMaker(InfluxClient):
         raise RuntimeError(f"Could not determine orgID for org {self.org}")
 
     def define_token(self) -> TokenPost:
-        tok = {
-            "description": "Token for task/alert creation",
-            "orgID": self.org_id,
-            "status": "active",
-            "permissions": [],
-        }
-        perms = []
+        perms: List[Permission] = []
         categories = (
             "buckets",
             "checks",
@@ -44,9 +39,16 @@ class TokenMaker(InfluxClient):
         for c in categories:
             for mode in ("read", "write"):
                 perms.append(
-                    {"action": mode, "resource": {"orgID": self.org_id, "type": c}}
-                )
-        tok["permissions"] = perms
+                    Permission(
+                        action=mode,
+                        resource=Resource(
+                            orgID=self.org_id,
+                            type= c)))
+        tok = TokenPost(
+            description="Token for task/alert creation",
+            orgID=self.org_id,
+            permissions=perms
+        )
         self.log.debug(f"Token: {tok}")
         return tok
 

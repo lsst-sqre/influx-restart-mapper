@@ -104,3 +104,22 @@ class InfluxClient:
             o_list.extend(i_list)
             last_id = i_list[-1]["id"]
         return o_list
+
+    async def list_all_with_offset(
+        self, url: str, itemtype: str, pagesize: int = 20
+    )-> List[Dict[str,Any]]:
+        """List all objects of a particular type."""
+        o_list = []
+        params: Dict[str, Any] = {"limit": pagesize}
+        offset = 0
+        while True:
+            params.update({"offset": offset})
+            obj = await self.get(url, params)
+            if not obj:
+                break
+            i_list = obj[itemtype]
+            if not i_list:
+                break
+            o_list.extend(i_list)
+            offset += len(i_list)
+        return o_list
